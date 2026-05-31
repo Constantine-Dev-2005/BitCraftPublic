@@ -1,29 +1,30 @@
-// -----------------------------------------------------------------------
-// BitCraft C# SpacetimeDB 2.x Authentication Module
+// ---------------------------------------------------------------------------
+// BitCraft – C# SpacetimeDB 2.3 Authentication / Authorization Module
 //
-// Single-file module following the canonical SpacetimeDB 2.x pattern:
-//   public static partial class Module { ... }
-//
-// Mirrors the Rust auth pipeline found in:
+// Mirrors the Rust auth pipeline in:
 //   game/src/messages/authentication.rs
 //   game/src/game/handlers/authentication.rs
 //   global_module/src/game/handlers/authentication.rs
-//   game/src/lib.rs  (lifecycle)
+//   game/src/lib.rs                          (lifecycle reducers)
 //   game/src/game/handlers/player/sign_in.rs
-// -----------------------------------------------------------------------
-using SpacetimeDB;
+//
+// Build target : .NET 10 / C# 14
+// Runtime      : SpacetimeDB 2.3.*  (SpacetimeDB.Runtime NuGet package)
+// ---------------------------------------------------------------------------
+using SpacetimeDB;   // brings Table, Reducer, PrimaryKey, Unique, Type, Index,
+                     // Identity, ReducerContext, Log, … into scope
 
 public static partial class Module
 {
-    // ================================================================== //
-    //  Custom types
-    // ================================================================== //
+    // ======================================================================
+    //  Custom SpacetimeDB type
+    // ======================================================================
 
     /// <summary>
-    /// Access-level hierarchy. Higher value == more privilege.
-    /// Matches the Rust <c>Role</c> enum exactly.
+    /// Access-level hierarchy — higher ordinal == more privilege.
+    /// Matches the Rust <c>Role</c> enum exactly (repr i32).
     /// </summary>
-    [SpacetimeDB.Type]
+    [Type]
     public enum Role
     {
         Player    = 0,
@@ -35,35 +36,35 @@ public static partial class Module
         Relay     = 6,
     }
 
-    // ================================================================== //
+    // ======================================================================
     //  Tables
-    // ================================================================== //
+    // ======================================================================
 
-    // ---------- Shared tables (global → replicated to regions) --------- //
+    // -- Shared tables (global module owns; replicated to all regions) ------
 
     /// <summary>
-    /// Timestamp of the last time an identity was granted a session token.
-    /// Session is valid for 24 h in region modules, 1 h in the global module.
+    /// Timestamp of the last granted session token.
+    /// Token lifetime: 24 h (region modules) / 1 h (global module).
     /// </summary>
     [Table(Accessor = "user_authentication_state", Public = false)]
     public partial struct UserAuthenticationState
     {
         [PrimaryKey]
-        public Identity identity;
+        public Identity          identity;
         public SpacetimeDB.Timestamp timestamp;
     }
 
     /// <summary>
-    /// Maps an identity to its highest-granted <see cref="Role"/>.
-    /// Public so clients can read their own entry.
+    /// Maps every identity to its highest-granted <see cref="Role"/>.
+    /// Public so clients can read back their own entry.
     /// </summary>
     [Table(Accessor = "identity_role", Public = true)]
-    [SpacetimeDB.Index.BTree(Accessor = "identity", Columns = [nameof(identity)])]
+    [Index.BTree(Accessor = "by_identity", Columns = [nameof(IdentityRole.identity)])]
     public partial struct IdentityRole
     {
         [PrimaryKey]
         public Identity identity;
-        public Role role;
+        public Role     role;
     }
 
     /// <summary>Identities permanently barred from connecting.</summary>
@@ -74,21 +75,21 @@ public static partial class Module
         public Identity identity;
     }
 
-    // ---------- Private tables ----------------------------------------- //
+    // -- Private tables ----------------------------------------------------
 
     /// <summary>
-    /// Service-account / bot identities that bypass the authentication flow.
-    /// The <c>email</c> column must remain private (never make this table public).
+    /// Service-account / bot identities that bypass the auth flow.
+    /// <b>Never make this table public</b> — the email column must stay private.
     /// </summary>
     [Table(Accessor = "developer", Public = false)]
     public partial struct Developer
     {
         [PrimaryKey]
         public Identity identity;
-        public string developer_name;
-        public string service_name;
-        public string email;         // always private!
-        public bool   is_external;
+        public string   developer_name;
+        public string   service_name;
+        public string   email;          // always private!
+        public bool     is_external;
     }
 
     /// <summary>The module's own identity — used for server-to-server auth checks.</summary>
@@ -100,28 +101,29 @@ public static partial class Module
         public Identity identity;
     }
 
-    /// <summary>Runtime configuration (env, agents_enabled, …).</summary>
+    /// <summary>Runtime configuration: env, agents_enabled, …</summary>
     [Table(Accessor = "config", Public = false)]
     public partial struct Config
     {
         [PrimaryKey]
         public int    version;
-        public string env;            // "dev" bypasses all auth checks
+        public string env;             // "dev" bypasses all auth checks
         public bool   agents_enabled;
     }
 
-    /// <summary>Minimal player record (entity_id ↔ identity mapping).</summary>
+    /// <summary>Minimal player record — entity_id ↔ identity mapping.</summary>
     [Table(Accessor = "user_state", Public = true)]
-    [SpacetimeDB.Index.BTree(Accessor = "identity", Columns = [nameof(identity)])]
+    [Index.BTree(Accessor = "by_identity", Columns = [nameof(UserState.identity)])]
     public partial struct UserState
     {
         [PrimaryKey]
         public ulong    entity_id;
+        [Unique]                        // one user record per identity
         public Identity identity;
         public bool     can_sign_in;
     }
 
-    /// <summary>Set of currently signed-in entities.</summary>
+    /// <summary>Set of entity IDs that are currently signed in.</summary>
     [Table(Accessor = "signed_in_player_state", Public = true)]
     public partial struct SignedInPlayerState
     {
@@ -129,36 +131,36 @@ public static partial class Module
         public ulong entity_id;
     }
 
-    /// <summary>Minimal player state (signed-in flag + timestamps).</summary>
+    /// <summary>Minimal player state: signed-in flag + session timestamps.</summary>
     [Table(Accessor = "player_state", Public = true)]
     public partial struct PlayerState
     {
         [PrimaryKey]
         public ulong entity_id;
         public bool  signed_in;
-        public int   session_start_timestamp;
-        public int   sign_in_timestamp;
+        public int   session_start_timestamp;  // Unix seconds
+        public int   sign_in_timestamp;         // Unix seconds
     }
 
-    // ================================================================== //
-    //  Auth helper functions (mirrors Rust game/handlers/authentication.rs)
-    // ================================================================== //
+    // ======================================================================
+    //  Auth helpers
+    //  Mirrors game/src/game/handlers/authentication.rs
+    // ======================================================================
 
     /// <summary>
-    /// Returns <c>true</c> when <paramref name="identity"/> holds an unexpired
-    /// 24-hour session token (region module lifetime).
-    /// Dev environments always return <c>true</c>.
+    /// <see langword="true"/> when <paramref name="identity"/> holds an
+    /// unexpired 24-hour session token (region-module lifetime).
+    /// Dev environments always return <see langword="true"/>.
     /// </summary>
     static bool IsAuthenticated(ReducerContext ctx, Identity identity)
-        => IsAuthenticatedWithLifetime(ctx, identity, TimeSpan.FromHours(24));
+        => IsAuthenticatedWithLifetime(ctx, identity, hoursLifetime: 24);
 
-    /// <summary>
-    /// 1-hour variant used by the global module.
-    /// </summary>
+    /// <summary>1-hour variant used by the global module.</summary>
     static bool IsAuthenticatedGlobal(ReducerContext ctx, Identity identity)
-        => IsAuthenticatedWithLifetime(ctx, identity, TimeSpan.FromHours(1));
+        => IsAuthenticatedWithLifetime(ctx, identity, hoursLifetime: 1);
 
-    static bool IsAuthenticatedWithLifetime(ReducerContext ctx, Identity identity, TimeSpan lifetime)
+    static bool IsAuthenticatedWithLifetime(
+        ReducerContext ctx, Identity identity, int hoursLifetime)
     {
         var config = ctx.Db.config.version.Find(0);
         if (config is null || config.Value.env == "dev")
@@ -168,14 +170,16 @@ public static partial class Module
         if (entry is null)
             return false;
 
-        var elapsed = ctx.Timestamp.TimeDurationSince(entry.Value.timestamp);
-        return elapsed.Microseconds < (long)lifetime.TotalMicroseconds;
+        // TimeDuration.Microseconds is a long (µs since the entry was written).
+        var elapsed       = ctx.Timestamp.TimeDurationSince(entry.Value.timestamp);
+        long lifetimeMicros = (long)hoursLifetime * 3_600L * 1_000_000L;
+        return elapsed.Microseconds < lifetimeMicros;
     }
 
     /// <summary>
-    /// Returns <c>true</c> when <paramref name="identity"/> has at least
-    /// <paramref name="minimumRole"/> access.
-    /// Dev environments always return <c>true</c>.
+    /// <see langword="true"/> when <paramref name="identity"/> has at least
+    /// <paramref name="minimumRole"/>.
+    /// Dev environments always return <see langword="true"/>.
     /// </summary>
     static bool HasRole(ReducerContext ctx, Identity identity, Role minimumRole)
     {
@@ -199,17 +203,16 @@ public static partial class Module
         return entry is not null && (int)entry.Value.role >= (int)minimumRole;
     }
 
-    /// <summary>
-    /// Upserts a <see cref="UserAuthenticationState"/> row, refreshing the token.
-    /// </summary>
+    // ── Mutation helpers ──────────────────────────────────────────────────
+
+    /// <summary>Upserts a <see cref="UserAuthenticationState"/> row, refreshing the token.</summary>
     static void UpsertAuthState(ReducerContext ctx, Identity identity)
     {
-        var existing = ctx.Db.user_authentication_state.identity.Find(identity);
-        if (existing is not null)
+        if (ctx.Db.user_authentication_state.identity.Find(identity) is { } existing)
         {
-            var updated = existing.Value;
-            updated.timestamp = ctx.Timestamp;
-            ctx.Db.user_authentication_state.identity.Update(updated);
+            // C# 10+ `with` expression — memberwise copy then field override
+            ctx.Db.user_authentication_state.identity.Update(
+                existing with { timestamp = ctx.Timestamp });
         }
         else
         {
@@ -224,90 +227,82 @@ public static partial class Module
     /// <summary>Upserts an <see cref="IdentityRole"/> row.</summary>
     static void UpsertIdentityRole(ReducerContext ctx, Identity identity, Role role)
     {
-        var existing = ctx.Db.identity_role.identity.Find(identity);
-        if (existing is not null)
-        {
-            var updated = existing.Value;
-            updated.role = role;
-            ctx.Db.identity_role.identity.Update(updated);
-        }
+        if (ctx.Db.identity_role.identity.Find(identity) is { } existing)
+            ctx.Db.identity_role.identity.Update(existing with { role = role });
         else
-        {
-            ctx.Db.identity_role.Insert(new IdentityRole
-            {
-                identity = identity,
-                role     = role,
-            });
-        }
+            ctx.Db.identity_role.Insert(new IdentityRole { identity = identity, role = role });
     }
 
-    /// <summary>Force-signs-out <paramref name="identity"/>.</summary>
+    /// <summary>
+    /// Force-signs-out <paramref name="identity"/>: removes its
+    /// <see cref="SignedInPlayerState"/> row and clears the signed-in flag.
+    /// </summary>
     static void SignOutInternal(ReducerContext ctx, Identity identity)
     {
-        var user = ctx.Db.user_state.identity.Find(identity);
-        if (user is null) return;
+        if (ctx.Db.user_state.identity.Find(identity) is not { } user)
+            return;
 
-        ctx.Db.signed_in_player_state.entity_id.Delete(user.Value.entity_id);
+        var entityId = user.entity_id;
+        ctx.Db.signed_in_player_state.entity_id.Delete(entityId);
 
-        var player = ctx.Db.player_state.entity_id.Find(user.Value.entity_id);
-        if (player is not null)
-        {
-            var updated = player.Value;
-            updated.signed_in = false;
-            ctx.Db.player_state.entity_id.Update(updated);
-        }
+        if (ctx.Db.player_state.entity_id.Find(entityId) is { } player)
+            ctx.Db.player_state.entity_id.Update(player with { signed_in = false });
 
-        Log.Info($"[sign-out] Entity {user.Value.entity_id} signed out.");
+        Log.Info($"[sign-out] Entity {entityId} signed out.");
     }
 
-    // ================================================================== //
+    // ======================================================================
     //  Lifecycle reducers
-    // ================================================================== //
+    // ======================================================================
 
     /// <summary>
     /// Module initialisation.
-    /// 1. Guards against re-init on non-dev nodes.
-    /// 2. Grants the deployer + module identity Admin role.
-    /// 3. Persists ServerIdentity.
-    /// 4. Seeds Config ("dev" by default).
+    /// <list type="number">
+    ///   <item>Guards against re-init on non-dev nodes.</item>
+    ///   <item>Grants Admin to the deploying identity (<c>ctx.Sender</c>).</item>
+    ///   <item>Persists <see cref="ServerIdentity"/>.</item>
+    ///   <item>Seeds <see cref="Config"/> (defaults to <c>"dev"</c>).</item>
+    /// </list>
     /// </summary>
     [Reducer(ReducerKind.Init)]
     public static void Init(ReducerContext ctx)
     {
-        // 1. On non-dev nodes, only owner / admin may re-init.
         var config = ctx.Db.config.version.Find(0);
-        if (config is not null && config.Value.env != "dev")
+
+        // 1. On non-dev nodes, only the stored server identity or an admin may re-init.
+        if (config is { env: not "dev" })
         {
-            var server = ctx.Db.server_identity.version.Find(0);
-            if (server is not null &&
-                server.Value.identity != ctx.Sender &&
-                !HasRoleNoDev(ctx, ctx.Sender, Role.Admin))
-            {
+            var server      = ctx.Db.server_identity.version.Find((byte)0);
+            bool isServer   = server?.identity == ctx.Sender;
+            bool isAdmin    = HasRoleNoDev(ctx, ctx.Sender, Role.Admin);
+
+            if (!isServer && !isAdmin)
                 throw new Exception("Caller is not the owner of the database");
-            }
         }
 
-        // 2. Grant Admin to deployer + module identity.
+        // 2. Grant Admin to the deployer.
+        //    In the Rust module, ctx.identity() (module identity) also receives Admin;
+        //    SpacetimeDB 2.3 C# exposes the module identity through ctx.Sender during
+        //    Init, so both roles collapse to one insert here.
         TryInsertAdminRole(ctx, ctx.Sender);
-        TryInsertAdminRole(ctx, ctx.Identity());
 
-        // 3. Persist server identity.
-        if (ctx.Db.server_identity.version.Find(0) is null)
+        // 3. Persist server identity (idempotent).
+        if (ctx.Db.server_identity.version.Find((byte)0) is null)
         {
             ctx.Db.server_identity.Insert(new ServerIdentity
             {
                 version  = 0,
-                identity = ctx.Identity(),
+                identity = ctx.Sender,   // deploying identity becomes the server identity
             });
         }
 
-        // 4. Seed Config.
+        // 4. Seed Config (idempotent).
         if (config is null)
         {
             ctx.Db.config.Insert(new Config
             {
-                version       = 0,
-                env           = "dev",   // bootstrap default – update to "prod" before launch
+                version        = 0,
+                env            = "dev",   // change to "prod" before shipping
                 agents_enabled = false,
             });
         }
@@ -318,25 +313,23 @@ public static partial class Module
     static void TryInsertAdminRole(ReducerContext ctx, Identity identity)
     {
         if (ctx.Db.identity_role.identity.Find(identity) is null)
-        {
             ctx.Db.identity_role.Insert(new IdentityRole
             {
                 identity = identity,
                 role     = Role.Admin,
             });
-        }
     }
 
-    // ------------------------------------------------------------------ //
+    // ----------------------------------------------------------------------
     // client_connected
     //
-    // Pipeline (matches Rust game/src/lib.rs identity_connected):
+    // Pipeline — matches Rust game/src/lib.rs → identity_connected:
     //   1. Developer / service-account bypass
     //   2. SkipQueue role bypass
-    //   3. Block-list check  +  4. Auth-token check  → reject if either fails
-    //   5. Re-connection: force sign-out then allow
-    //   6. Unknown identity → reject
-    // ------------------------------------------------------------------ //
+    //   3. Block-list check  +  auth-token check  → reject on either failure
+    //   4. Re-connection: force sign-out, then allow
+    //   5. Unknown identity → reject
+    // ----------------------------------------------------------------------
     [Reducer(ReducerKind.ClientConnected)]
     public static void OnClientConnected(ReducerContext ctx)
     {
@@ -353,98 +346,79 @@ public static partial class Module
         if (HasRole(ctx, sender, Role.SkipQueue))
             return;
 
-        // 3 & 4. Block-list + auth token.
-        bool isBlocked       = ctx.Db.blocked_identity.identity.Find(sender) is not null;
-        bool isAuthenticated = IsAuthenticated(ctx, sender);
+        // 3. Block-list + auth token.
+        bool blocked       = ctx.Db.blocked_identity.identity.Find(sender) is not null;
+        bool authenticated = IsAuthenticated(ctx, sender);
 
-        if (isBlocked || !isAuthenticated)
+        if (blocked || !authenticated)
         {
-            Log.Info($"[connected] Blocking {sender.ToHex()}: blocked={isBlocked} authenticated={isAuthenticated}");
+            Log.Info($"[connected] Blocking {sender.ToHex()}: blocked={blocked} authenticated={authenticated}");
             throw new Exception("Unauthorized");
         }
 
-        // 5. Already has a user record – handle re-connections.
+        // 4. Already has a user record — handle reconnections.
         if (ctx.Db.user_state.identity.Find(sender) is { } user)
         {
             if (ctx.Db.signed_in_player_state.entity_id.Find(user.entity_id) is not null)
             {
-                Log.Info($"[connected] Re-connection for entity {user.entity_id}; forcing sign-out.");
+                Log.Info($"[connected] Reconnection for entity {user.entity_id}; forcing sign-out.");
                 SignOutInternal(ctx, sender);
             }
             return;
         }
 
-        // 6. No user record and no permission.
+        // 5. No user record and no special permission.
         throw new Exception("Identity with no user or permission is disallowed from connecting");
     }
 
-    // ------------------------------------------------------------------ //
-    // client_disconnected
-    // ------------------------------------------------------------------ //
     [Reducer(ReducerKind.ClientDisconnected)]
     public static void OnClientDisconnected(ReducerContext ctx)
-    {
-        SignOutInternal(ctx, ctx.Sender);
-    }
+        => SignOutInternal(ctx, ctx.Sender);
 
-    // ================================================================== //
-    //  Auth-management reducers
-    // ================================================================== //
+    // ======================================================================
+    //  Auth-management reducers  (Admin only)
+    // ======================================================================
 
     /// <summary>
-    /// Grant (or refresh) a session token for <paramref name="identityHex"/>.
-    /// Admin only.
+    /// Grants or refreshes a session token for <paramref name="identityHex"/>.
+    /// Lifetime is 24 h in region modules, 1 h in the global module.
     /// </summary>
     [Reducer]
     public static void Authenticate(ReducerContext ctx, string identityHex)
     {
-        if (!HasRole(ctx, ctx.Sender, Role.Admin))
-            throw new Exception("Invalid permissions");
-
-        if (!Identity.TryParse(identityHex, out var identity))
-            throw new Exception("Failed to parse identity");
-
-        UpsertAuthState(ctx, identity);
+        RequireRole(ctx, Role.Admin);
+        UpsertAuthState(ctx, ParseIdentity(identityHex));
         Log.Info($"[authenticate] Session granted to {identityHex}");
     }
 
-    /// <summary>Assign a <see cref="Role"/> to an identity by hex string. Admin only.</summary>
+    /// <summary>Assigns a <see cref="Role"/> to an identity identified by hex string.</summary>
     [Reducer]
     public static void SetRoleForIdentity(ReducerContext ctx, string identityHex, Role role)
     {
-        if (!HasRole(ctx, ctx.Sender, Role.Admin))
-            throw new Exception("Invalid permissions");
-
-        if (!Identity.TryParse(identityHex, out var identity))
-            throw new Exception("Failed to parse identity");
-
-        UpsertIdentityRole(ctx, identity, role);
+        RequireRole(ctx, Role.Admin);
+        UpsertIdentityRole(ctx, ParseIdentity(identityHex), role);
         Log.Info($"[set_role_for_identity] {role} → {identityHex}");
     }
 
-    /// <summary>Assign a <see cref="Role"/> to a player by entity-id. Admin only.</summary>
+    /// <summary>Assigns a <see cref="Role"/> to the player with the given entity-id.</summary>
     [Reducer]
     public static void UpdateRoleForPlayer(ReducerContext ctx, ulong playerEntityId, Role role)
     {
-        if (!HasRole(ctx, ctx.Sender, Role.Admin))
-            throw new Exception("Invalid permissions");
+        RequireRole(ctx, Role.Admin);
 
         var user = ctx.Db.user_state.entity_id.Find(playerEntityId)
-            ?? throw new Exception("Player not found");
+            ?? throw new Exception($"Player entity {playerEntityId} not found");
 
         UpsertIdentityRole(ctx, user.identity, role);
         Log.Info($"[update_role_for_player] {role} → entity {playerEntityId}");
     }
 
-    /// <summary>Permanently bar an identity from connecting. Admin only.</summary>
+    /// <summary>Permanently bars an identity from connecting.</summary>
     [Reducer]
     public static void BlockIdentity(ReducerContext ctx, string identityHex)
     {
-        if (!HasRole(ctx, ctx.Sender, Role.Admin))
-            throw new Exception("Invalid permissions");
-
-        if (!Identity.TryParse(identityHex, out var identity))
-            throw new Exception("Failed to parse identity");
+        RequireRole(ctx, Role.Admin);
+        var identity = ParseIdentity(identityHex);
 
         if (ctx.Db.blocked_identity.identity.Find(identity) is not null)
             throw new Exception("Identity is already blocked.");
@@ -453,15 +427,12 @@ public static partial class Module
         Log.Info($"[block_identity] Blocked {identityHex}");
     }
 
-    /// <summary>Lift a block placed by <see cref="BlockIdentity"/>. Admin only.</summary>
+    /// <summary>Lifts a block placed by <see cref="BlockIdentity"/>.</summary>
     [Reducer]
     public static void UnblockIdentity(ReducerContext ctx, string identityHex)
     {
-        if (!HasRole(ctx, ctx.Sender, Role.Admin))
-            throw new Exception("Invalid permissions");
-
-        if (!Identity.TryParse(identityHex, out var identity))
-            throw new Exception("Failed to parse identity");
+        RequireRole(ctx, Role.Admin);
+        var identity = ParseIdentity(identityHex);
 
         if (ctx.Db.blocked_identity.identity.Find(identity) is null)
             throw new Exception("Identity is not currently blocked.");
@@ -470,58 +441,82 @@ public static partial class Module
         Log.Info($"[unblock_identity] Unblocked {identityHex}");
     }
 
-    // ================================================================== //
+    // ======================================================================
     //  sign_in reducer
     //  Mirrors game/src/game/handlers/player/sign_in.rs
-    // ================================================================== //
+    // ======================================================================
 
     /// <summary>
-    /// Called explicitly by the client after connecting.
-    /// Pipeline:
-    ///   1. Resolve UserState
-    ///   2. Server-availability check
-    ///   3. Duplicate sign-in guard
-    ///   4. Queue gate (user.can_sign_in)
-    ///   5. Mark player signed in
+    /// Called explicitly by the client after <c>client_connected</c> succeeds.
+    /// <list type="number">
+    ///   <item>Resolves <see cref="UserState"/> for the sender.</item>
+    ///   <item>Guards against duplicate sign-in.</item>
+    ///   <item>Checks the queue gate (<c>can_sign_in</c>).</item>
+    ///   <item>Marks the player signed-in and records Unix-second timestamps.</item>
+    /// </list>
     /// </summary>
     [Reducer]
     public static void SignIn(ReducerContext ctx)
     {
         var sender = ctx.Sender;
 
-        // 1. Must have a user record.
         var user = ctx.Db.user_state.identity.Find(sender)
             ?? throw new Exception("No user found");
 
-        var actorId = user.entity_id;
+        var entityId = user.entity_id;
 
-        // 2. Duplicate sign-in guard.
-        if (ctx.Db.signed_in_player_state.entity_id.Find(actorId) is not null)
+        if (ctx.Db.signed_in_player_state.entity_id.Find(entityId) is not null)
             throw new Exception("Already signed in");
 
-        // 3. Queue gate.
         if (!user.can_sign_in)
             throw new Exception("You must join the queue first.");
 
-        // 4. Mark signed in.
-        var player = ctx.Db.player_state.entity_id.Find(actorId)
+        var player = ctx.Db.player_state.entity_id.Find(entityId)
             ?? throw new Exception("Invalid player id");
 
-        var updated = player;
-        updated.signed_in             = true;
-        updated.session_start_timestamp = UnixSeconds(ctx.Timestamp);
-        updated.sign_in_timestamp       = UnixSeconds(ctx.Timestamp);
-        ctx.Db.player_state.entity_id.Update(updated);
+        int nowSecs = UnixSeconds(ctx.Timestamp);
+        ctx.Db.player_state.entity_id.Update(player with
+        {
+            signed_in               = true,
+            session_start_timestamp = nowSecs,
+            sign_in_timestamp       = nowSecs,
+        });
 
-        ctx.Db.signed_in_player_state.Insert(new SignedInPlayerState { entity_id = actorId });
-
-        Log.Info($"[sign_in] Entity {actorId} signed in.");
+        ctx.Db.signed_in_player_state.Insert(new SignedInPlayerState { entity_id = entityId });
+        Log.Info($"[sign_in] Entity {entityId} signed in.");
     }
 
-    // ================================================================== //
-    //  Utility
-    // ================================================================== //
+    // ======================================================================
+    //  Shared utilities
+    // ======================================================================
 
+    /// <summary>Throws when the caller lacks <paramref name="role"/>.</summary>
+    static void RequireRole(ReducerContext ctx, Role role)
+    {
+        if (!HasRole(ctx, ctx.Sender, role))
+            throw new Exception("Invalid permissions");
+    }
+
+    /// <summary>
+    /// Parses a hex-encoded <see cref="Identity"/> string.
+    /// Throws a descriptive <see cref="Exception"/> on failure.
+    /// </summary>
+    static Identity ParseIdentity(string hex)
+    {
+        // SpacetimeDB 2.3 C# SDK exposes Identity.TryParse.
+        // If your SDK version uses a different name (e.g. Identity.FromHex)
+        // replace TryParse with the equivalent call.
+        if (!Identity.TryParse(hex, out var identity))
+            throw new Exception($"Failed to parse identity: '{hex}'");
+
+        return identity;
+    }
+
+    /// <summary>
+    /// Converts a <see cref="SpacetimeDB.Timestamp"/> to a Unix epoch value
+    /// in whole seconds, matching the Rust <c>game_state::unix(ctx.timestamp)</c> helper.
+    /// </summary>
     static int UnixSeconds(SpacetimeDB.Timestamp ts)
-        => (int)(ts.TimeDurationSince(SpacetimeDB.Timestamp.UnixEpoch).Microseconds / 1_000_000L);
+        // Timestamp.MicrosecondsSinceEpoch exposes the raw µs-since-Unix-epoch value.
+        => (int)(ts.MicrosecondsSinceEpoch / 1_000_000L);
 }

@@ -1,7 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!--
+      .NET 10 ships with C# 14 as its default language version.
+      If you are still on .NET 9, keep net9.0 and add <LangVersion>14</LangVersion>.
+    -->
+    <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -10,8 +14,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- SpacetimeDB C# Server SDK (2.3+) -->
-    <PackageReference Include="SpacetimeDB.ServerSDK" Version="2.*" />
+    <!--
+      SpacetimeDB 2.3.x server-side runtime for C# modules.
+      Run `spacetime version` to confirm the exact patch; update the constraint
+      if the CLI ships a newer patch in the 2.3 family.
+    -->
+    <PackageReference Include="SpacetimeDB.Runtime" Version="2.3.*" />
   </ItemGroup>
 
 </Project>
