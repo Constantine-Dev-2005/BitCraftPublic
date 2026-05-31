@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>BitCraftAuthModule</AssemblyName>
+    <RootNamespace>BitCraft.Auth</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SpacetimeDB C# Server SDK (2.3+) -->
+    <PackageReference Include="SpacetimeDB.ServerSDK" Version="2.*" />
+  </ItemGroup>
+
+</Project>
